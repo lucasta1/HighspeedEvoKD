@@ -1,6 +1,6 @@
 from .AB import ABLoss
 from .AT import Attention
-from .AutoKD import AutoKD, Batch_kl, Channel_gmml2, Channel_kl, Spatial_kl
+# from .AutoKD import AutoKD, Batch_kl, Channel_gmml2, Channel_kl, Spatial_kl
 from .CC import Correlation
 from .FitNet import HintLoss
 from .FSP import FSP

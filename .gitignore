@@ -1,0 +1,8 @@
+**/__pycache__/
+
+nasbench/
+# git clone https://github.com/google-research/nasbench.git
+# cd nasbench
+# pip install -e .
+data/
+output_graphs/

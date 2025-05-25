@@ -4,7 +4,7 @@ import random
 
 from models.nasbench101.model import Network as NBNetwork
 
-nasbench_path = '/data/home/scv6681/run/github/nasbench/nasbench_only108.tfrecord'
+nasbench_path = '/home/taichi/Project_KU2/HighspeedEvoKD/data/nasbench_only108.tfrecord'
 nb = api.NASBench(nasbench_path)
 # # hash_iterator
 
@@ -115,5 +115,6 @@ def get_nb101_model_and_acc(_hash):
 
 def get_rnd_nb101_and_acc():
     ava_hashs = nb.hash_iterator()
-    rand_hash = random.sample(ava_hashs, 1)[0]
+    # rand_hash = random.sample(ava_hashs, 1)[0]
+    rand_hash = random.sample(sorted(ava_hashs), 1)[0]
     return get_nb101_model(rand_hash), query_nb101_acc(rand_hash), rand_hash
