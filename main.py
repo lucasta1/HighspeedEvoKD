@@ -17,15 +17,18 @@ import os
 import argparse
 import json
 import math
+import heapq
 import random
 import sys
 import time
-from collections import deque
 from pathlib import Path
-from typing import List, Tuple
+from collections import deque
+from itertools import product
+from pathlib import Path
+from typing import Optional, List, Tuple
 
 import torch
-import torch.nn as nn
+import torch.nn as nn, optim
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import TensorDataset, DataLoader
@@ -96,27 +99,192 @@ def to_scalar(val):
     return float(val)                          # float, int, np.float64 など
 
 
+def _find_last_conv(model: nn.Module) -> nn.Module:
+    for module in reversed(list(model.modules())):
+        if isinstance(module, nn.Conv2d):
+            return module
+    raise ValueError("No Conv2d layer found in model – please supply target_layer.")
+
+
+class _GradCamHook:
+    """Internal utility storing activations & gradients from a chosen layer."""
+
+    def __init__(self, layer: nn.Module):
+        self.activations: Optional[torch.Tensor] = None
+        self.gradients: Optional[torch.Tensor] = None
+        self._fwd = layer.register_forward_hook(self._save_activation)
+        self._bwd = layer.register_full_backward_hook(self._save_gradient)
+
+    def _save_activation(self, _, __, output):
+        # output: Tensor of shape (N, C, H, W)
+        self.activations = output.detach()
+        return None  # no modification
+
+    def _save_gradient(self, _, __, grad_output):
+        # grad_output is a tuple – take first element
+        self.gradients = grad_output[0].detach()
+        return None
+
+    def close(self):
+        self._fwd.remove()
+        self._bwd.remove()
+
+
+def _grad_cam_maps(model: nn.Module, x: torch.Tensor, layer: nn.Module) -> torch.Tensor:
+    """Return Grad‑CAM maps (N, H, W) for the *batch*."""
+    hook = _GradCamHook(layer)
+
+    model.zero_grad(set_to_none=True)
+    logits = model(x)  # (N, num_classes)
+
+    # Follow DisWOT: use class‑agnostic sum of logits
+    score = logits.sum()
+    score.backward()
+
+    assert hook.activations is not None and hook.gradients is not None, "Hooks failed."
+    act = hook.activations  # (N, C, H, W)
+    grad = hook.gradients   # (N, C, H, W)
+
+    weights = grad.mean(dim=(2, 3), keepdim=True)  # (N, C, 1, 1)
+    cam = (weights * act).sum(dim=1)  # (N, H, W)
+    cam = F.relu(cam)
+
+    # normalise each map to [0,1] (avoid div‑by‑zero)
+    cam = cam.view(cam.size(0), -1)
+    cam = cam / (cam.amax(dim=1, keepdim=True) + 1e-8)
+    cam = cam.view_as(cam)
+
+    hook.close()
+    return cam  # (N, H, W)
+
+
+def _channel_correlation(maps: torch.Tensor) -> torch.Tensor:
+    """Return channel‑wise correlation matrix given CAMs.
+
+    maps: Tensor (N, H, W)  – Grad‑CAM maps per sample.
+    Returns: (C, C) correlation; here C = N (batch) by paper’s notation.
+    We instead follow paper Eq.(3): correlation across *channels* of CAM;
+    but since we have already aggregated channels into CAM, use sample index
+    as proxy.  This implementation mirrors authors' released code, where they
+    use *channel* dimension of *feature map* for semantic metric – we emulate
+    by treating flattened spatial dims as feature vectors per channel.
+    """
+    # reshape to (N, H*W)
+    Fm = maps.view(maps.size(0), -1)  # (N, HW)
+    # correlation (cosine similarity matrix) – normalised dot products
+    norm = F.normalize(Fm, dim=1)  # (N, HW)
+    corr = norm @ norm.T  # (N, N)
+    # L2 normalise whole matrix as paper
+    corr = corr / (corr.norm(p=2) + 1e-8)
+    return corr  # (N, N)
+
+
+def _sample_relation_matrix(feat: torch.Tensor) -> torch.Tensor:
+    """Compute sample‑wise correlation matrix for flattened feature maps."""
+    N = feat.size(0)
+    flat = feat.view(N, -1)
+    norm = F.normalize(flat, dim=1)
+    rel = norm @ norm.T  # (N, N)
+    rel = rel / (rel.norm(p=2) + 1e-8)
+    return rel
+
+
+def diswot_score(
+    teacher: nn.Module,
+    student: nn.Module,
+    x: torch.Tensor,
+    device,
+) -> float:
+    """Compute DisWOT score for *random‑initialised* teacher‑student pair.
+
+    Parameters
+    ----------
+    teacher, student : nn.Module
+        Networks **must** be in evaluation mode *before* calling.
+    x : torch.Tensor (N, C, H, W)
+        A single mini‑batch (paper uses one mini‑batch, e.g. 32 or 64 images).
+    device : torch.device
+        CUDA recommended; CPU OK but slower.
+    teacher_layer, student_layer : nn.Module | None
+        Specific layers for Grad‑CAM.  If omitted, last Conv2d is auto‑detected.
+    Returns
+    -------
+    float
+        DisWOT score – *smaller is better* (closer teacher–student similarity).
+    """
+    teacher = teacher.to(device)
+    student = student.to(device)
+
+    t_layer = _find_last_conv(teacher)
+    s_layer = _find_last_conv(student)
+
+    with torch.no_grad(), autocast(enabled=device.type == "cuda"):
+        # Grad‑CAM maps
+        cam_t = _grad_cam_maps(teacher, x, t_layer)  # (N, H, W)
+        cam_s = _grad_cam_maps(student, x, s_layer)  # (N, H, W)
+
+    # Semantic metric M_s
+    G_t = _channel_correlation(cam_t)
+    G_s = _channel_correlation(cam_s)
+    M_s = F.mse_loss(G_t, G_s, reduction="sum").sqrt()  # L2 distance
+
+    # Relation metric M_r – feature maps before GAP (same layers)
+    with torch.no_grad():
+        feat_t = t_layer.output if hasattr(t_layer, "output") else None  # placeholder
+
+    # To avoid re‑forwarding, compute features explicitly (no grad)
+    def _extract_feat(model: nn.Module, layer: nn.Module):
+        outputs = {}
+
+        def hook_fn(_, __, out):
+            outputs["feat"] = out.detach()
+        h = layer.register_forward_hook(hook_fn)
+        model(x)  # forward
+        h.remove()
+        return outputs["feat"]
+
+    feat_t = _extract_feat(teacher, t_layer)  # (N, C, H, W)
+    feat_s = _extract_feat(student, s_layer)
+
+    A_t = _sample_relation_matrix(feat_t)  # (N, N)
+    A_s = _sample_relation_matrix(feat_s)
+    M_r = F.mse_loss(A_t, A_s, reduction="sum").sqrt()
+
+    score = (M_s + M_r).item()
+
+    # Optional cleanup to free VRAM when used in tight loops
+    del cam_t, cam_s, feat_t, feat_s, A_t, A_s
+    torch.cuda.empty_cache()
+    return score
+
+
 # =============================================================
 #  2. スコア計算 (DisWOT + NWOT + SynFlow)
 # =============================================================
-def zc_score(net: nn.Module, x: torch.Tensor, gpu: torch.device) -> float:
-    net.eval()
+def zc_score_pair(teacher: nn.Module, 
+                  student: nn.Module, 
+                  x: torch.Tensor, 
+                  gpu: torch.device) -> float:
+    teacher.eval()
+    student.eval()
 
-    # ---------- DisWOT（GPU 半精度） ----------
+    # ---------- DisWOT風スコア（GPU 半精度） ----------
     with torch.no_grad(), autocast('cuda'):
-        feat, _ = net.forward_with_features(x)
-        comp = net.classifier.weight.unsqueeze(-1).unsqueeze(-1)
-        d_val = -ICKDLoss()([comp], [comp])[0] - Similarity()(feat[-2], feat[-2])[0]
-
-    # ---------- Zero-Cost proxies（CPU） ----------
+        d_val = diswot_score(teacher, 
+                             student, 
+                             x.to(gpu), 
+                             gpu)
+    # ---------- Zero-cost proxies（CPU） ----------
     cpu = torch.device('cpu')
-    net_cpu = net.to(cpu)
-    dummy = TensorDataset(x.cpu(), torch.zeros(x.size(0), dtype=torch.long))
+    student_cpu = student.to(cpu)
+
+    dummy = TensorDataset(x.cpu(), 
+                          torch.zeros(x.size(0), dtype=torch.long))
     loader = DataLoader(dummy, batch_size=x.size(0))
 
     with torch.enable_grad():
         measures = predictive.find_measures_arrays(
-            net_cpu,
+            student_cpu,
             loader,
             ("random", 1, x.size(0)),
             cpu,
@@ -128,8 +296,9 @@ def zc_score(net: nn.Module, x: torch.Tensor, gpu: torch.device) -> float:
     nwot    = to_scalar(measures["nwot"])
     synflow = to_scalar(measures["synflow"])
 
-    # （必要なら）GPU へ戻す
-    net.to(gpu)
+    # GPU に戻す（メモリ管理上任意）
+    teacher.to(gpu)
+    student.to(gpu)
 
     return d_val.item() + nwot + synflow
 
@@ -138,119 +307,93 @@ def zc_score(net: nn.Module, x: torch.Tensor, gpu: torch.device) -> float:
 #  3. スクリーニング (世代毎)
 # =============================================================
 def screening(
-    gen: int,                     # 現在の世代番号（例: 第3世代 → 3）
-    pop: int,                     # 集めたいアーキテクチャの数（母集団サイズ）
-    device: torch.device,         # モデルを配置するデバイス（GPUなど）
-    batch: torch.Tensor,          # Zero-Cost スコアを計算するための画像バッチ
-    max_p: int,                   # 許容する最大パラメータ数
-) -> List[Tuple[str, float]]:
-    """条件を満たす pop 個のモデルを集めてスコア付けし、良い順に返す。"""
+    gen: int,
+    teacher_hashes: set[str],
+    student_models: set[str],
+    device: torch.device,
+    batch: torch.Tensor,
+) -> List[Tuple[Tuple[str, str], float]]:
+    """teacher × student の全組み合わせに対して zero-cost スコアを計算。"""
+    res: List[Tuple[Tuple[str, str], float]] = []
+    all_pairs = list(product(teacher_hashes, student_models))
 
-    # 結果を保存するリスト（要素は: モデルのハッシュとスコアのタプル）
-    res: List[Tuple[str, float]] = []
-    # 何回モデル生成・試行を行ったか（条件不適合で捨てた分も含む）
-    trials = 0
+    with tqdm(total=len(all_pairs), desc=f"Gen{gen:03d}") as bar:
+        for teacher_hash, student_hash in all_pairs:
+            try:
+                # モデルの構築
+                teacher_model = get_nb101_model(teacher_hash).to(device)
+                student_model = get_nb101_model(student_hash).to(device)
 
-    # プログレスバーを使って進捗を表示（例: Gen003）
-    with tqdm(total=pop, desc=f"Gen{gen:03d}") as bar:
-        # 条件を満たすモデルが pop 個集まるまでループ
-        while len(res) < pop:
-            trials += 1  # 試行回数をインクリメント
-            # ランダムにアーキテクチャを生成し、構造のハッシュを取得
-            net, _acc, h = get_rnd_nb101_and_acc()
-            # パラメータ数と FLOPs を計測
-            p = num_params(net)
-            # パラメータ数や FLOPs が制限を超えていたらスキップ（条件不適合）
-            if p > max_p is False:
-                continue
-            
-            # モデルをガウス初期化して GPU に移動
-            net.apply(gaussian_init).to(device)
-            # Zero-Cost Proxy によるスコア計算（訓練なしの軽量評価）
-            s = zc_score(net, batch, device)
-            del net
-            torch.cuda.empty_cache()
-            
-            # 結果としてハッシュとスコアを追加
-            res.append((h, s))
-            # プログレスバー更新（残り個数が減る）
+                # Zero-cost スコアの計算（関数がペア対応している場合）
+                score = zc_score_pair(teacher_model, 
+                                      student_model, 
+                                      batch, 
+                                      device)
+
+                # メモリ開放（重要）
+                del teacher_model, student_model
+                torch.cuda.empty_cache()
+
+                res.append(((teacher_hash, student_hash), score))
+                bar.set_postfix(s=f"{score:.2f}")
+            except Exception as e:
+                print(f"Failed to process pair ({teacher_hash}, {student_hash}): {e}")
+
             bar.update(1)
-            # パラメータ、FLOPs、スコアをリアルタイム表示（進捗バーの横に）
-            bar.set_postfix(p=f"{p/1e6:.1f}M", s=f"{s:.1f}")
-    # スコアが高い順に並び替え（降順）
+
     res.sort(key=lambda x: x[1], reverse=True)
-    # 何回試行したかを表示（条件不適合によるリトライも含む）
-    print(f"[Gen {gen}] Trials: {trials}")
-    # スコア付き構造（ハッシュ, スコア）のリストを返す
     return res
 
 
 # =============================================================
 #  4. ミニ KD (3 エポック)
 # ============================================================
-def quick_kd(
-    arch: str,
+def quick_kd_pair(
+    gen: int,
+    teacher_hash: str,
+    student_hash: str,
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: torch.device,
     epochs: int = 3
 ) -> float:
     """
-    ランダム初期化した教師モデルと生徒モデルを使って簡易な知識蒸留を行い、
-    バリデーションデータに対する精度（Accuracy）を返す。
-
-    Parameters:
-        arch (str): モデルアーキテクチャ名。
-        train_loader (DataLoader): 訓練データローダー。
-        val_loader (DataLoader): 検証データローダー。
-        device (torch.device): モデルとデータを配置するデバイス。
-        epochs (int): 学習エポック数（デフォルト: 3）
-
-    Returns:
-        float: 検証データに対する精度（%）
+    与えられたハッシュから教師モデル／生徒モデルを読み込んで
+    知識蒸留を行い、検証精度を返す。
     """
+    # --- 教師モデルの準備と重みロード ---
+    teacher_model = get_nb101_model(teacher_hash).to(device)
+    weight_path = Path(f"./weights/gen_{gen-1:03d}/{teacher_hash}_{epochs}.pth")
+    if not weight_path.exists():
+        raise FileNotFoundError(f"Teacher model weight not found at: {weight_path}")
+    teacher_model.load_state_dict(torch.load(weight_path, map_location=device))
+    teacher_model.eval()
 
-    # --- 教師モデルと生徒モデルを初期化（ランダム） ---
-    teacher_model, _, _ = get_nb101_model(arch, pretrained=False)
-    teacher_model.apply(gaussian_init).to(device).eval()  # 教師は学習しないので eval モード
-
-    student_model, _, _ = get_nb101_model(arch, pretrained=False)
+    # --- 生徒モデル（未学習） ---
+    student_model = get_nb101_model(student_hash)
     student_model.apply(gaussian_init).to(device)
 
-    # --- 最適化とスケジューラの設定 ---
     optimizer = torch.optim.SGD(
         student_model.parameters(), lr=0.05, momentum=0.9, weight_decay=5e-4
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs * len(train_loader)
     )
-
-    # --- AMP（自動混合精度）用のスケーラー ---
     scaler = GradScaler()
+    kd_loss_fn = nn.KLDivLoss(reduction="batchmean")
+    ce_loss_fn = nn.CrossEntropyLoss()
 
-    # --- 損失関数の定義 ---
-    kd_loss_fn = nn.KLDivLoss(reduction="batchmean")  # 知識蒸留用のKL損失
-    ce_loss_fn = nn.CrossEntropyLoss()                # 通常の分類損失
-
-    # --- 学習ループ（簡易） ---
-    for epoch in range(epochs):
+    for _ in range(epochs):
         student_model.train()
         for batch_index, (images, labels) in enumerate(train_loader):
-            if batch_index >= 100:  # 処理時間削減のため100バッチまで
+            if batch_index >= 100:
                 break
-
-            images = images.to(device)
-            labels = labels.to(device)
+            images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad(set_to_none=True)
-
-            # --- 自動混合精度による順伝播と損失計算 ---
             with autocast():
                 with torch.no_grad():
-                    teacher_outputs = teacher_model(images)  # 教師の出力（勾配なし）
-
-                student_outputs = student_model(images)      # 生徒の出力
-
-                # 蒸留損失（温度T=4）＋クロスエントロピー損失の加重平均
+                    teacher_outputs = teacher_model(images)
+                student_outputs = student_model(images)
                 loss = (
                     0.7 * kd_loss_fn(
                         F.log_softmax(student_outputs / 4, dim=1),
@@ -258,33 +401,97 @@ def quick_kd(
                     )
                     + 0.3 * ce_loss_fn(student_outputs, labels)
                 )
-
-            # --- 勾配の逆伝播と更新 ---
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()  # 学習率をスケジューリング
+            scheduler.step()
 
-    # --- 評価ループ（最大2000サンプルまで） ---
+    # --- 評価 ---
     student_model.eval()
-    correct_predictions = 0
-    total_samples = 0
-
+    correct = total = 0
     with torch.no_grad():
         for images, labels in val_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            predictions = student_model(images).argmax(dim=1)  # 予測ラベル
-            correct_predictions += (predictions == labels).sum().item()
-            total_samples += labels.size(0)
-
-            if total_samples >= 2000:  # 早期終了（2000件までで評価）
+            images, labels = images.to(device), labels.to(device)
+            preds = student_model(images).argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            if total >= 2000:
                 break
 
-    # --- 精度（%）を計算して返す ---
-    accuracy = 100 * correct_predictions / total_samples
-    return accuracy
+    return 100 * correct / total
+
+
+def full_kd_pair(
+    gen: int,
+    teacher_hash: str,
+    student_hash: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    epochs: int
+) -> float:
+    # --- モデル準備 ---
+    teacher_model = get_nb101_model(teacher_hash)
+    weight_path = Path(f"./weights/gen_{gen-1:03d}/{teacher_hash}_{epochs}.pth")
+    if not weight_path.exists():
+        raise FileNotFoundError(f"Teacher model weight not found at: {weight_path}")
+    teacher_model.load_state_dict(torch.load(weight_path, map_location=device))
+    teacher_model.to(device).eval()
+
+    student_model = get_nb101_model(student_hash)
+    student_model.apply(gaussian_init).to(device)
+
+    # --- オプティマイザ・スケジューラ・AMPスケーラー・損失関数 ---
+    optimizer = torch.optim.SGD(
+        student_model.parameters(), lr=0.05, momentum=0.9, weight_decay=5e-4
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs * len(train_loader)
+    )
+    scaler = GradScaler()
+    kd_loss_fn = nn.KLDivLoss(reduction="batchmean")
+    ce_loss_fn = nn.CrossEntropyLoss()
+
+    # --- 学習ループ ---
+    for epoch in range(epochs):
+        student_model.train()
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast():
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(images)
+                student_outputs = student_model(images)
+                loss = (
+                    0.7 * kd_loss_fn(
+                        F.log_softmax(student_outputs / 4, dim=1),
+                        F.softmax(teacher_outputs / 4, dim=1)
+                    )
+                    + 0.3 * ce_loss_fn(student_outputs, labels)
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+    # --- モデル保存 ---
+    save_dir = Path(f"./weights/gen_{gen:03d}")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / f"{student_hash}_{epochs}.pth"
+    torch.save(student_model.state_dict(), save_path)
+    print(f"Saved student model after KD: {save_path}")
+
+    # --- 評価ループ ---
+    student_model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            preds = student_model(images).argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+    return 100 * correct / total
 
 
 # =============================================================
@@ -305,64 +512,132 @@ def run(args):
     # 評価の高いアーキテクチャ（モデル構造）のハッシュ (str) を保存するリスト
     # deque（両端キュー）を使うことで、最大長を超えると自動で古いもの (先に入れたもの) が削除される
     # args.elite_pool の値によって最大保存数が決まる
-    elite: deque[str] = deque(maxlen=args.elite_pool)
+    teacher: list[str] = list()
+    teacher_hashes: set[str] = set()
+    student: list[str] = list()
+    student_hashes: set[str] = set()
 
-    # 性能が悪かったり、すでに評価済みで再利用したくないアーキテクチャのハッシュを記録する集合
-    # set にすることで高速に「すでに登録済みかどうか」を判定できる
-    ban_pool: set[str] = set()
+    # 世代ごとにスクリーニングを実行
+    print("=== Zero-Cost + DisWOT 探索開始 ===")
+    for gen in range(1, args.generations + 1):
+        print(f"\n===== Generation {gen}/{args.generations} =====")
+        """
+        gen=0 の場合はモデルの性能を nasbench101 から取得
+        それ以外の世代では、スクリーニングを行い、
+        上位のモデルを選び、次の世代に進む。
+        """
+        if gen == 1:
+            # 最初の世代はランダムにモデルを生成するだけ
+            # ひょっとしたら初期ノイズがうまくいくかもしれないから
+            # 例えば 10 個のモデルを生成する
+            while len(teacher) < args.teacher_pool:
+                net, acc, hash = get_rnd_nb101_and_acc()
+                if hash in teacher_hashes:
+                    continue  # すでに登録済みならスキップ
+                p = num_params(net)
+                # パラメータ数や FLOPs が制限を超えていたらスキップ
+                if p > args.max_params is False:
+                    continue
+                
+                net = net.to(device)
+                criterion = nn.CrossEntropyLoss()
+                optimizer = optim.Adam(net.parameters(), lr=0.01)
 
-    t0 = time.time()
-    try:
-        # 世代ごとにスクリーニングを実行
-        print("=== 実験フェーズ1/2: Zero-Cost + DisWOT 探索開始 ===")
-        for gen in range(1, args.generations + 1):
-            print(f"\n===== Generation {gen}/{args.generations} =====")
+                num_epochs = args.pretrain_epochs
+                for _ in range(num_epochs):
+                    net.train()
+                    for x, y in train_loader:
+                        x, y = x.to(device), y.to(device)
+                        optimizer.zero_grad()
+                        output = net(x)
+                        loss = criterion(output, y)
+                        loss.backward()
+                        optimizer.step()
+                
+                # ----- モデル保存 -----
+                save_dir = Path(f"./weights/gen_{gen:03d}")
+                save_dir.mkdir(parents=True, exist_ok=True)
+                save_path = save_dir / f"{hash}_{num_epochs}.pth"
+                torch.save(net.state_dict(), save_path)
+                print(f"Saved model: {save_path}")
+                        
+                teacher.append((acc, hash))
+                teacher_hashes.add(hash)
+        else:
+            print(f"Gen {gen} Screening: Start")
+            # 生徒モデルのプールを初期化
+            while len(student) < args.student_pool:
+                net, acc, hash = get_rnd_nb101_and_acc()
+                if hash in student_hashes:
+                    continue  # すでに登録済みならスキップ
+                p = num_params(net)
+                # パラメータ数や FLOPs が制限を超えていたらスキップ
+                if p > args.max_params is False:
+                    continue
+                student.append((acc, hash))
+                student_hashes.add(hash)
+            
+            # スクリーニングを実行して、上位のモデルを取得
             scr = screening(gen, 
-                            args.pop_size, 
+                            teacher_hashes,
+                            student_hashes,
                             device, 
                             batch_gpu, 
                             args.max_params)
-            top_hash = [h for h, _ in scr[: args.keep_top]]
-            elite.extend(top_hash)
+            elite = scr[: args.student_pool]
             print(f"Gen {gen} Screening: Done")
 
-            if gen % args.milestone == 0:
-                print("[Milestone KD]  上位モデルを 3epoch 蒸留で再評価…")
-                kd_res = []
-                for h in top_hash:
-                    acc = quick_kd(h, train_loader, val_loader, device)
-                    kd_res.append((h, acc))
-                    print(f"  {h[:6]} : {acc:.2f}%")
-                kd_res.sort(key=lambda x: x[1], reverse=True)
-                ban_pool.update(h for h, _ in kd_res[: args.ban_pool])
-                print("BAN 候補追加:", kd_res[: args.ban_pool])
-            print(f"Elapsed {(time.time()-t0)/3600:.2f}h | BAN pool {len(ban_pool)}\n")
-    except KeyboardInterrupt:
-        print("\n⏹️  中断されました。ここまでの結果を保存します。")
+            kd_res = list()
+            # mini KD
+            for (teacher_hash, student_hash), zero_cost_score in elite:
+                acc = quick_kd_pair(
+                    gen,
+                    teacher_hash, 
+                    student_hash, 
+                    train_loader, 
+                    val_loader, 
+                    device,
+                    epochs=3
+                )
+                kd_res.append(((teacher_hash, student_hash), acc))
+                print(f"  {teacher_hash[:6]}→{student_hash[:6]} : {acc:.2f}% (zc={zero_cost_score:.2f})")
 
-    # サマリー保存
-    Path("summary.json").write_text(json.dumps({
-        "elite": list(elite),
-        "ban_pool": list(ban_pool),
-    }, indent=2))
-    print("✅ summary.json 保存完了 — 実験フェーズ1/2 終了")
+            # 上位 n_top 件だけ抜き出し
+            kd_res.sort(key=lambda x: x[1], reverse=True)
+            top_kd = kd_res[: args.n_top]
+            print(f"[Full KD] 上位 {args.n_top} 件で本番 KD を実行します。")
+
+            # 本番 KD
+            for (teacher_hash, student_hash), quick_acc in top_kd:
+                print(f"  ▶ {teacher_hash[:6]}→{student_hash[:6]} (quick={quick_acc:.2f}%)")
+                full_acc = full_kd_pair(
+                    gen,
+                    teacher_hash,
+                    student_hash,
+                    train_loader,
+                    val_loader,
+                    device,
+                    epochs=args.full_kd_epochs
+                )
+                print(f"    → Full KD accuracy: {full_acc:.2f}%")
+
 
 # =============================================================
 #  6. CLI
 # =============================================================
-
-
 if __name__ == "__main__":
     """
     実験のエントリーポイント。以下の処理を行います：
 
     1. コマンドライン引数を定義：
         - --generations      : 探索を行う世代数(進化回数)
-        - --pop-size         : 各世代で評価する個体(（)モデル)数
+        - --pop-size         : 各世代で評価する個体(モデル)数
         - --keep-top         : 各世代で残す上位モデルの数
         - --milestone        : 何世代ごとに蒸留評価(Milestone KD)を行うか
         - --ban-pool         : Milestone KD で ban 候補として追加するモデル数
-        - --elite-pool       : エリートプール(優秀モデル履歴)の最大長
+        - --pretrain-epochs  : 初期モデルの学習エポック数
+        - --teacher-pool     : 教師プール(教師モデル履歴)の最大長
+        - --student-pool     : 生徒プール(生徒モデル履歴)の最大長
         - --max-params       : モデルの最大パラメータ数(これを超えると不採用)
         - --screen-batch     : Zero-Cost 指標評価で使用する画像枚数
         - --seed             : 乱数シード(再現性を確保)
@@ -377,8 +652,9 @@ if __name__ == "__main__":
     ap.add_argument("--pop-size", type=int, default=10)
     ap.add_argument("--keep-top", type=int, default=5)
     ap.add_argument("--milestone", type=int, default=5)
-    ap.add_argument("--ban-pool", type=int, default=5)
-    ap.add_argument("--elite-pool", type=int, default=20)
+    ap.add_argument("--pretrain-epochs", type=int, default=50)
+    ap.add_argument("--teacher-pool", type=int, default=10)
+    ap.add_argument("--student-pool", type=int, default=10)
     ap.add_argument("--max-params", type=int, default=22000000)
     ap.add_argument("--screen-batch", type=int, default=32)
     ap.add_argument("--seed", type=int, default=42)
@@ -392,7 +668,9 @@ if __name__ == "__main__":
     print("  Keep top:", args.keep_top)
     print("  Milestone:", args.milestone)
     print("  Ban pool:", args.ban_pool)
-    print("  Elite pool:", args.elite_pool)
+    print("  Pretrain epochs:", args.pretrain_epochs)
+    print("  Teacher pool:", args.teacher_pool)
+    print("  Student pool:", args.student_pool)
     print("  Max params:", args.max_params)
     print("  Screen batch size:", args.screen_batch)
     print("  Seed:", args.seed)
