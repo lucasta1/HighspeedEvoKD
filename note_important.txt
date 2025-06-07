@@ -1,0 +1,24 @@
+I modified here
+
+/home/taichi/anaconda3/envs/fastnas/lib/python3.11/site-packges/nas_201_api/api.201.py
+
+```
+class NASBench201API(NASBenchMetaAPI):
+
+  """ The initialization function that takes the dataset file path (or a dict loaded from that path) as input. """
+  def __init__(self, file_path_or_dict: Optional[Union[Text, Dict]]=None,
+               verbose: bool=True):
+    self.filename = None
+    self.reset_time()
+    if file_path_or_dict is None:
+      file_path_or_dict = os.path.join(os.environ['TORCH_HOME'], ALL_BENCHMARK_FILES[-1])
+      print ('Try to use the default NAS-Bench-201 path from {:}.'.format(file_path_or_dict))
+    if isinstance(file_path_or_dict, str) or isinstance(file_path_or_dict, Path):
+      file_path_or_dict = str(file_path_or_dict)
+      if verbose: print('try to create the NAS-Bench-201 api from {:}'.format(file_path_or_dict))
+      assert os.path.isfile(file_path_or_dict), 'invalid path : {:}'.format(file_path_or_dict)
+      self.filename = Path(file_path_or_dict).name
+      file_path_or_dict = torch.load(file_path_or_dict, 
+                                     map_location='cpu',
+                                     weights_only=False)
+```
