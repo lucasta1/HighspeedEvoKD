@@ -1,6 +1,6 @@
 I modified here
 
-/home/taichi/anaconda3/envs/fastnas/lib/python3.11/site-packges/nas_201_api/api.201.py
+/home/taichi/anaconda3/envs/fastnas/lib/python3.11/site-packges/nas_201_api/api_201.py
 
 ```
 class NASBench201API(NASBenchMetaAPI):
@@ -19,6 +19,5 @@ class NASBench201API(NASBenchMetaAPI):
       assert os.path.isfile(file_path_or_dict), 'invalid path : {:}'.format(file_path_or_dict)
       self.filename = Path(file_path_or_dict).name
       file_path_or_dict = torch.load(file_path_or_dict, 
-                                     map_location='cpu',
-                                     weights_only=False)
+                                     map_location='cpu') <- here!
 ```
