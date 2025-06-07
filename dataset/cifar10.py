@@ -5,6 +5,7 @@ import socket
 
 import numpy as np
 from PIL import Image
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from torchvision import datasets, transforms
@@ -75,7 +76,7 @@ def get_cifar10_dataloaders(batch_size=128, num_workers=8, is_instance=False):
         transforms.Normalize((0.5071, 0.4867, 0.4408),
                              (0.2675, 0.2565, 0.2761)),
     ])
-    test_transform = transforms.Compose([
+    valid_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5071, 0.4867, 0.4408),
                              (0.2675, 0.2565, 0.2761)),
@@ -382,3 +383,30 @@ def get_cifar10_dataloaders_entropy(batch_size=128,
                                   indices[split:num_train]))
 
     return train_loader, valid_loader, n_data
+
+
+class CIFAR10GPUData:
+    def __init__(self, data_dir="./data", device="cuda"):
+        self.data_dir = data_dir
+        self.device = device
+
+    def load(self):
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+
+        trainset = datasets.CIFAR10(root=self.data_dir, train=True, download=False, transform=transform)
+        validset = datasets.CIFAR10(root=self.data_dir, train=False, download=False, transform=transform)
+
+        self.train_images = torch.stack([img for img, _ in trainset]).to(self.device)
+        self.train_labels = torch.tensor([label for _, label in trainset]).to(self.device)
+        self.valid_images = torch.stack([img for img, _ in validset]).to(self.device)
+        self.valid_labels = torch.tensor([label for _, label in validset]).to(self.device)
+
+    def get_train_data(self):
+        return self.train_images, self.train_labels
+
+    def get_valid_data(self):
+        return self.valid_images, self.valid_labels
+
