@@ -6,3 +6,11 @@ nasbench/
 # pip install -e .
 data/
 output_graphs/
+analysis/
+_tester/
+
+**/*.pth
+**/*.csv
+
+summary.json
+run.sh
