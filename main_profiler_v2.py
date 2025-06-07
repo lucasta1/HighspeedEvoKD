@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import gc
+import csv
 import argparse
 import json
 import math
@@ -38,8 +39,10 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import TensorDataset, DataLoader
 import torch.backends.cudnn as cudnn
-cudnn.benchmark = False                  # アルゴリズム探索で巨大 WS を選ばせない
-cudnn.max_workspace_size = 512 * 1024**2 # 512 MB に上限（PyTorch ≥2.2）
+cudnn.benchmark = True
+cudnn.max_workspace_size = 1024 * 1024**2   # 1 GiB
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 import warnings
 warnings.filterwarnings(
@@ -81,10 +84,63 @@ except ImportError:
 # =============================================================
 #  1. ユーティリティ
 # =============================================================
+# ---------- CUDA Prefetcher ----------
+class CUDAPrefetcher:
+    """次バッチをサブストリームで先に GPU 転送する薄いラッパー"""
+    def __init__(self, loader: torch.utils.data.DataLoader, device: torch.device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device)
+        self.iter_loader = iter(loader)
+        self.next_data = None
+        self.preload()
+
+    def preload(self):
+        try:
+            data = next(self.iter_loader)
+        except StopIteration:
+            self.next_data = None
+            return
+        # ─ 非同期転送は別ストリームで ─
+        with torch.cuda.stream(self.stream):
+            if isinstance(data, (list, tuple)):
+                self.next_data = tuple(
+                    d.to(self.device, non_blocking=True) for d in data
+                )
+            else:
+                self.next_data = data.to(self.device, non_blocking=True)
+
+    def __iter__(self):
+        self.iter_loader = iter(self.loader)  # <- ここで毎回初期化
+        self.preload()
+        return self
+
+    def __next__(self):
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        if self.next_data is None:
+            raise StopIteration
+        data = self.next_data
+        self.preload()
+        return data
+    
+    def __len__(self):
+        # DataLoader のバッチ数を返す
+        return len(self.loader)
+
+
 def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     random.seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+_MODEL_CACHE: dict[str, nn.Module] = {}
+def get_model_cached(hash_str: str, device: torch.device) -> nn.Module:
+    mdl = _MODEL_CACHE.get(hash_str)
+    if mdl is None:
+        mdl = get_nb201_model(hash_str).to(device)
+        _MODEL_CACHE[hash_str] = mdl
+    return mdl
 
 
 def num_params(net: nn.Module) -> int:
@@ -381,8 +437,8 @@ def screening(
         for teacher_hash, student_hash in all_pairs:
             try:
                 # モデルの構築
-                teacher_model = get_nb201_model(teacher_hash).to(device)
-                student_model = get_nb201_model(student_hash).to(device)
+                teacher_model = get_model_cached(teacher_hash, device) # .to(device)
+                student_model = get_model_cached(student_hash, device) # .to(device)
 
                 # Zero-cost スコアの計算（関数がペア対応している場合）
                 score = zc_score_pair(teacher_model, 
@@ -416,29 +472,29 @@ def full_kd_pair(
     val_loader: DataLoader,
     device: torch.device,
     epochs: int,
-    timestamp: str
+    timestamp: str,
+    kd_weight: float = 0.7,
+    ce_weight: float = 0.3,
 ) -> float:
     # --- モデル準備 ---
-    teacher_model = get_nb201_model(teacher_hash)
+    teacher_model = get_nb201_model(teacher_hash).to(device)
     weight_path = Path(f"/mnt/newssd/weights_log/{timestamp}/gen_{gen-1:03d}/{teacher_hash}.pth")
     if not weight_path.exists():
         raise FileNotFoundError(f"Teacher model weight not found at: {weight_path}")
     teacher_model.load_state_dict(torch.load(weight_path, map_location=device))
     teacher_model.to(device).eval()
 
-    student_model = get_nb201_model(student_hash)
-    student_model.apply(gaussian_init).to(device)
+    student_model = get_nb201_model(student_hash).to(device)
+    # student_model.apply(gaussian_init).to(device)
 
     # --- オプティマイザ・スケジューラ・AMPスケーラー・損失関数 ---
-    # optimizer = torch.optim.SGD(
-    #     student_model.parameters(), lr=0.05, momentum=0.9, weight_decay=5e-4
-    # )
-    optimizer = torch.optim.AdamW(student_model.parameters(),
-                                  lr=0.01,
-                                  fused=True)
+    optimizer = torch.optim.Adam(student_model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs * len(train_loader)
     )
+    
+    train_loader = CUDAPrefetcher(train_loader, device)   # ✔ 追加
+    val_loader   = CUDAPrefetcher(val_loader,   device)
     
     kd_loss_fn = nn.KLDivLoss(reduction="batchmean")
     ce_loss_fn = nn.CrossEntropyLoss()
@@ -455,11 +511,11 @@ def full_kd_pair(
 
             student_outputs = student_model(images)
             loss = (
-                0.7 * kd_loss_fn(
+                kd_weight * kd_loss_fn(
                     F.log_softmax(student_outputs / 4, dim=1),
                     F.softmax(teacher_outputs / 4, dim=1)
                 )
-                + 0.3 * ce_loss_fn(student_outputs, labels)
+                + ce_weight * ce_loss_fn(student_outputs, labels)
             )
 
             loss.backward()
@@ -502,18 +558,44 @@ def print_gpu_mem(note=""):
     print(f"[GPU MEM] {note} | Allocated: {allocated:.1f} MB | Reserved: {reserved:.1f} MB")
     
 
-def run(args):
+def run(args):    
     # デバイス設定準備
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seeds(args.seed)
     timestamp = str(datetime.today().strftime("%Y%m%d_%H%M%S"))
-        
+    
+    # プロファイリング
+    profile_csv_path = f"timing_log_{timestamp}.csv"
+    if not os.path.exists(profile_csv_path):
+        with open(profile_csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Section", "Time(s)"])
+            
+    # acc の追跡
+    acc_log = f"acc_log_{timestamp}.csv"
+    if not os.path.exists(acc_log):
+        with open(acc_log, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Generation", "Model ID", "Hash", "Accuracy"])
+    
+    ts_data_prep = time.perf_counter()  # 初期化（後で計測に使う）
     # データ準備
-    train_loader, val_loader = get_cifar10_dataloaders(batch_size=args.batch, num_workers=min(8, os.cpu_count()))
+    # train_loader, val_loader = get_cifar10_dataloaders(batch_size=args.batch, num_workers=min(8, os.cpu_count()))
+    train_loader_raw, val_loader_raw = get_cifar10_dataloaders(
+        batch_size=args.batch,
+        num_workers=min(8, os.cpu_count())
+    )
+    train_loader = CUDAPrefetcher(train_loader_raw, device)  # ✔ GPU プリフェッチ
+    val_loader   = CUDAPrefetcher(val_loader_raw,   device)  # ✔ 同上
     # イテレータを作成して，１バッチ目を取得
     batch_gpu, _ = next(iter(train_loader))
     # バッチの中でも指定の数 (screen_batch) だけを採用，計算するデバイスに送る
     batch_gpu = batch_gpu[: args.screen_batch].to(device)
+    tg_data_prep = time.perf_counter()
+    with open(profile_csv_path, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Data Preparation", f"{tg_data_prep - ts_data_prep :.4f}"])
+    
 
     # 評価の高いアーキテクチャ（モデル構造）のハッシュ (str) を保存するリスト
     # deque（両端キュー）を使うことで、最大長を超えると自動で古いもの (先に入れたもの) が削除される
@@ -533,6 +615,7 @@ def run(args):
         if gen == 1:
             # 最初の世代はランダムにモデルを生成するだけ (優秀なモデルに限定しない)
             start_time = time.perf_counter()
+            model_id = 0
             while len(teacher_hashes) < args.teacher_pool:
                 net, acc, hash = get_rnd_nb201_and_acc()
                 if hash in teacher_hashes:
@@ -540,12 +623,16 @@ def run(args):
                 if not check_net_configs(args, net, device):
                     continue  # パラメータ数や FLOPs が制限を超えていたらスキップ
                 
+                ts_pretrain = time.perf_counter()  # 初期化（後で計測に使う）
                 net = net.to(device)
-                criterion = nn.CrossEntropyLoss()
-                optimizer = optim.Adam(net.parameters(), lr=0.01)
-                # print(f"Total parameters: {sum(p.numel() for p in net.parameters()):,}")
-
                 num_epochs = args.pretrain_epochs
+                criterion = nn.CrossEntropyLoss()
+                optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=num_epochs * len(train_loader)
+                )
+                # print(f"Total parameters: {sum(p.numel() for p in net.parameters()):,}")
+                
                 for epoch in tqdm(range(num_epochs),
                                   desc=f"Ancestor Pretraining",
                                   colour="green",
@@ -564,8 +651,29 @@ def run(args):
                         loss = criterion(output, y)
                         loss.backward()
                         optimizer.step()
+                        scheduler.step()
+                # 検証
+                """
+                correct = total = 0
+                with torch.no_grad():
+                    for images, labels in val_loader:
+                        images, labels = images.to(device), labels.to(device)
+                        preds = net(images).argmax(dim=1)
+                        correct += (preds == labels).sum().item()
+                        total += labels.size(0)
+                acc = 100 * correct / total
+                with open(acc_log, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([gen, model_id, hash, acc])
+                """
+                
+                tg_pretrain = time.perf_counter()
+                with open(profile_csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([f"Gen {gen} Pretrain", f"{tg_pretrain - ts_pretrain :.4f}"])
                     
                 # ----- モデル保存 -----
+                ts_savemodel_gen0 = time.perf_counter()
                 save_dir = Path(f"/mnt/newssd/weights_log/{timestamp}/gen_{gen:03d}")
                 save_dir.mkdir(parents=True, exist_ok=True)
                 save_path = save_dir / f"{hash}.pth"
@@ -580,7 +688,13 @@ def run(args):
                 # teacher.append((acc, hash))
                 teacher_hashes.add(hash)
                 end_time = time.perf_counter()
-                print(f"[Gen {gen}] Teacher model {str(hash)[:6]} trained: {acc:.2f}% in {end_time - start_time:.2f} seconds")
+      
+                tg_savemodel_gen0 = time.perf_counter()
+                with open(profile_csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([f"Gen {gen} Save Model", f"{tg_savemodel_gen0 - ts_savemodel_gen0 :.4f}"])
+                
+                model_id += 1
                     
         else:
             start_time = time.perf_counter()
@@ -600,20 +714,28 @@ def run(args):
             # ── Screening レベルのプログレスバー
             all_pairs = list(product(teacher_hashes, student_hashes))
             scr = []
+            pair_counter = 0
             for teacher_hash, student_hash in tqdm(all_pairs, 
                                                    desc="Screening",
                                                    total=len(all_pairs),
                                                    colour="yellow",
                                                    position=1,
                                                    leave=False):
+                ts_pair_scoring = time.perf_counter()  # 初期化（後で計測に使う）
                 # 元の screening 内の処理を呼び出し
                 score = zc_score_pair(
-                    get_nb201_model(teacher_hash).to(device),
-                    get_nb201_model(student_hash).to(device),
+                    get_model_cached(teacher_hash, device), # .to(device)
+                    get_model_cached(student_hash, device), # .to(device)
                     batch_gpu,
                     device,
                 )
                 scr.append(((teacher_hash, student_hash), score))
+                pair_counter += 1
+                tg_pair_scoring = time.perf_counter()
+                with open(profile_csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([f"Gen {gen} Pair Scoring {pair_counter}", f"{tg_pair_scoring - ts_pair_scoring :.4f}"])
+                
             scr.sort(key=lambda x: x[1], reverse=True)
             elite = scr[: args.student_pool]
             # print(f"Gen {gen} Screening: Done")
@@ -623,25 +745,37 @@ def run(args):
 
             # print(f"[Full KD] 上位 {args.student_pool} 件で本番 KD を実行します。")
             # ── Full KD レベルのプログレスバー
+            model_id
             for (t_hash, s_hash), quick_acc in tqdm(elite,
                                                     desc="Full KD",
                                                     total=len(elite),
                                                     colour="magenta",
                                                     position=2,
                                                     leave=False):
+                ts_kd = time.perf_counter()  # 初期化（後で計測に使う）
                 # 本番 KD 実行
                 full_acc = full_kd_pair(
                     gen,
                     t_hash,
                     s_hash,
                     train_loader,
-                    val_loader,
+                    val_loader_raw,
                     device,
                     epochs=args.full_kd_epochs,
-                    timestamp=timestamp
+                    timestamp=timestamp,
+                    kd_weight=args.kd_weight,
+                    ce_weight=args.ce_weight,
                 )
                 teacher_hashes.add(s_hash)
                 print(f"[Full KD] Gen {gen} {str(t_hash)[:6]}→{str(s_hash)[:6]} : {full_acc:.2f}%")
+                tg_kd = time.perf_counter()
+                with open(profile_csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([f"Gen {gen} Full KD {str(t_hash)[:6]}→{str(s_hash)[:6]}", f"{tg_kd - ts_kd :.4f}"])
+                with open(acc_log, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([gen, model_id, s_hash, full_acc])
+                model_id += 1
             end_time = time.perf_counter()
             print(f"[Gen {gen}] Full KD completed in {end_time - start_time:.2f} seconds")
 
@@ -663,6 +797,9 @@ if __name__ == "__main__":
         - --screen-batch     : Zero-Cost 指標評価で使用する画像枚数
         - --seed             : 乱数シード(再現性を確保)
         - --batch            : CIFAR-10 の学習バッチサイズ(quick_kd 用)
+        - --kd-weight        : 知識蒸留損失の重み
+        - --ce-weight        : クロスエントロピー損失の重み
+        
     2. 引数を表示し、設定内容のログを出力。
     3. `run(args)` を呼び出して探索フェーズ1を開始。
     4. 探索終了後、summary.json に結果を保存し、
@@ -675,9 +812,11 @@ if __name__ == "__main__":
     ap.add_argument("--teacher-pool", type=int, default=10)
     ap.add_argument("--student-pool", type=int, default=10)
     ap.add_argument("--max-params", type=int, default=10000000)
-    ap.add_argument("--screen-batch", type=int, default=256)
+    ap.add_argument("--screen-batch", type=int, default=512)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--kd-weight", type=float, default=0.7, help="Weight for KD loss")
+    ap.add_argument("--ce-weight", type=float, default=0.3, help="Weight for CE loss")
     
     args = ap.parse_args()
 
@@ -691,8 +830,11 @@ if __name__ == "__main__":
     print("  Screen batch size:", args.screen_batch)
     print("  Seed:", args.seed)
     print("  Batch size:", args.batch)
+    print("  KD weight:", args.kd_weight)
+    print("  CE weight:", args.ce_weight)
     print("=========================================")
 
     run(args)
 
     print("=== 実験終了 ===")
+    
